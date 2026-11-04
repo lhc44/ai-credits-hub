@@ -1,0 +1,30 @@
+{
+  "name": "ai-credits-hub",
+  "version": "1.0.0",
+  "description": "AI编程工具多账号积分管理与自动签到平台",
+  "main": "server/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server:dev\" \"npm run client:dev\"",
+    "server:dev": "nodemon server/index.js",
+    "client:dev": "cd client && npm run dev",
+    "build": "cd client && npm run build",
+    "start": "NODE_ENV=production node server/index.js",
+    "checkin": "node server/tasks/checkin.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "cookie-parser": "^1.4.6",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0",
+    "concurrently": "^8.2.2"
+  }
+}

@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: ai-credits-hub
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-this}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-5 8 * * *}
+      - CHECKIN_DELAY_MIN=${CHECKIN_DELAY_MIN:-10}
+      - CHECKIN_DELAY_MAX=${CHECKIN_DELAY_MAX:-120}
+      - DB_PATH=/app/data/database.db
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
