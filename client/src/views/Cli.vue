@@ -30,8 +30,8 @@
           <div class="session-info">
             <div class="session-title">{{ s.title || '新对话' }}</div>
             <div class="session-meta">
-              <span>{{ s.messages.length }} 条消息</span>
-              <span>· {{ s.model.replace('-preview', '') }}</span>
+              <span>{{ s.messages?.length || 0 }} 条消息</span>
+              <span>· {{ (s.model || 'hy4').replace('-preview', '') }}</span>
             </div>
           </div>
           <button
@@ -209,7 +209,7 @@
 
               <!-- 回答正文 (Markdown 渲染 + 打字机光标) -->
               <div v-if="msg.content || !msg.streaming" class="msg-bubble">
-                <div class="msg-markdown markdown-body" v-html="renderMarkdown(msg.content)"></div>
+                <div class="msg-markdown markdown-body" v-html="msg._rendered || msg.content"></div>
                 <span v-if="msg.streaming && msg.content" class="streaming-cursor">▍</span>
               </div>
 
@@ -383,20 +383,51 @@ const quickPrompts = [
 const sessions = ref([])
 const currentSessionId = ref('')
 
-// 初始化加载会话
+// 初始化加载会话 (深度清洗历史数据，默认折叠历史思考链，大幅减轻 DOM 渲染负担)
 function loadSessionsFromStorage() {
   try {
     const raw = localStorage.getItem(SESSIONS_STORAGE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw)
       if (Array.isArray(parsed) && parsed.length > 0) {
-        sessions.value = parsed
-        currentSessionId.value = parsed[0].id
-        selectedModel.value = parsed[0].model || 'hy4-preview'
+        sessions.value = parsed.map(s => ({
+          id: s.id || ('session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+          title: s.title || '新对话',
+          model: s.model || 'hy4-preview',
+          cliSessionId: s.cliSessionId || null,
+          messages: (Array.isArray(s.messages) ? s.messages : []).map(m => {
+            const content = m.content || ''
+            let rendered = ''
+            try {
+              rendered = content ? marked.parse(content) : ''
+            } catch (e) {
+              rendered = content
+            }
+            return {
+              role: m.role || 'user',
+              content: content,
+              _rendered: rendered,
+              thinking: m.thinking || '',
+              showThinking: false, // 历史消息默认收起深度思考，保证点击瞬间流畅无卡顿
+              toolCalls: Array.isArray(m.toolCalls) ? m.toolCalls : [],
+              showTools: false,    // 历史消息默认收起工具列表
+              model: m.model || 'hy4-preview',
+              duration_ms: m.duration_ms || 0,
+              time: m.time || '',
+              streaming: false
+            }
+          })
+        }))
+
+        const first = sessions.value[0]
+        currentSessionId.value = first.id
+        selectedModel.value = first.model || 'hy4-preview'
         return
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn('历史会话恢复异常，重置:', e)
+  }
 
   // 默认新建一个初始会话
   createNewSession()
@@ -556,8 +587,12 @@ const localCommand = computed(() => {
   }
 })
 
+let scrollScheduled = false
 function scrollToBottom() {
-  nextTick(() => {
+  if (scrollScheduled) return
+  scrollScheduled = true
+  requestAnimationFrame(() => {
+    scrollScheduled = false
     if (messagesContainer.value) {
       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
     }
@@ -629,8 +664,9 @@ async function submitCurrentMessage() {
   const aiMsg = {
     role: 'assistant',
     content: '',
+    _rendered: '',
     thinking: '',
-    showThinking: true, // 默认展开深度思考过程
+    showThinking: true, // 当前实时生成的这轮消息默认展开思考过程
     toolCalls: [],
     showTools: true,
     model: selectedModel.value,
@@ -642,6 +678,20 @@ async function submitCurrentMessage() {
   }
   curSes.messages.push(aiMsg)
   scrollToBottom()
+
+  // 节流渲染定时器：流式接收阶段每 60ms 解析一次 Markdown，彻底解决频繁 parse 造成的浏览器卡死
+  let renderTimer = null
+  function scheduleThrottledRender() {
+    if (renderTimer) return
+    renderTimer = setTimeout(() => {
+      renderTimer = null
+      try {
+        aiMsg._rendered = marked.parse(aiMsg.content)
+      } catch (e) {
+        aiMsg._rendered = aiMsg.content
+      }
+    }, 60)
+  }
 
   try {
     const token = localStorage.getItem('token')
@@ -671,6 +721,7 @@ async function submitCurrentMessage() {
         errText = await response.text()
       }
       aiMsg.content = `❌ 请求异常 (${response.status}): ${errText}`
+      aiMsg._rendered = aiMsg.content
       aiMsg.streaming = false
       saveSessionsToStorage()
       return
@@ -703,6 +754,7 @@ async function submitCurrentMessage() {
             scrollToBottom()
           } else if (data.type === 'text_delta' && data.delta) {
             aiMsg.content = (aiMsg.content || '') + data.delta
+            scheduleThrottledRender()
             scrollToBottom()
           } else if (data.type === 'status' && data.status) {
             aiMsg.liveStatus = data.status
@@ -716,15 +768,22 @@ async function submitCurrentMessage() {
             aiMsg.liveStatus = `⚡ 正在服务器执行工具: ${data.tool.name}...`
             scrollToBottom()
           } else if (data.type === 'done') {
+            if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
             if (data.sessionId) curSes.cliSessionId = data.sessionId
             if (data.duration_ms) aiMsg.duration_ms = data.duration_ms
             if (!aiMsg.content && data.reply) aiMsg.content = data.reply
             if (!aiMsg.thinking && data.thinking) aiMsg.thinking = data.thinking
+            try {
+              aiMsg._rendered = marked.parse(aiMsg.content)
+            } catch (e) {
+              aiMsg._rendered = aiMsg.content
+            }
             aiMsg.streaming = false
             aiMsg.liveStatus = ''
-            if (aiMsg.content) renderMarkdown(aiMsg.content)
           } else if (data.type === 'error') {
+            if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
             aiMsg.content = (aiMsg.content ? aiMsg.content + '\n\n' : '') + `❌ 错误: ${data.message}`
+            aiMsg._rendered = aiMsg.content
             aiMsg.streaming = false
           }
         } catch (e) {
@@ -733,8 +792,14 @@ async function submitCurrentMessage() {
       }
     }
   } catch (err) {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     aiMsg.content = (aiMsg.content ? aiMsg.content + '\n\n' : '') + `❌ 网络异常或中断: ${err.message || '未知错误'}`
+    aiMsg._rendered = aiMsg.content
   } finally {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    if (aiMsg.content && !aiMsg._rendered) {
+      try { aiMsg._rendered = marked.parse(aiMsg.content) } catch (e) { aiMsg._rendered = aiMsg.content }
+    }
     aiMsg.streaming = false
     sending.value = false
     scrollToBottom()
@@ -1719,8 +1784,6 @@ onMounted(() => {
   cursor: pointer;
   font-size: 13px;
 }
-</style>
-
 /* 历史更早消息分页折叠栏 */
 .history-pagination-bar {
   display: flex;
@@ -1801,3 +1864,4 @@ onMounted(() => {
   from { opacity: 0; transform: translateY(3px); }
   to { opacity: 1; transform: translateY(0); }
 }
+</style>
