@@ -147,8 +147,18 @@
 
         <!-- 消息流 -->
         <div v-else class="messages-stream">
+          <!-- 历史更早消息折叠/分页加载栏 -->
+          <div v-if="hiddenHistoryCount > 0" class="history-pagination-bar">
+            <button class="btn-load-history" @click="loadMoreHistory">
+              📜 查看更早的 {{ hiddenHistoryCount }} 条历史记录
+            </button>
+            <button class="btn-load-history-all" @click="displayCount = currentMessages.length">
+              全部展开
+            </button>
+          </div>
+
           <div
-            v-for="(msg, index) in currentMessages"
+            v-for="(msg, index) in visibleMessages"
             :key="index"
             :class="['msg-item', msg.role === 'user' ? 'msg-user' : 'msg-ai']"
           >
@@ -161,6 +171,12 @@
                 <span class="meta-pill model-pill">{{ msg.model || selectedModel }}</span>
                 <span v-if="msg.duration_ms" class="meta-pill time-pill">⏱️ {{ (msg.duration_ms / 1000).toFixed(1) }}s</span>
                 <button class="meta-action-btn" @click="copyText(msg.content)">📋 复制结果</button>
+              </div>
+
+              <!-- 实时执行状态指示胶囊 (流式阶段动态显示，消除卡顿与中断感) -->
+              <div v-if="msg.streaming" class="live-status-pill">
+                <span class="pulsing-radar"></span>
+                <span class="status-pill-text">{{ getLiveStatusText(msg) }}</span>
               </div>
 
               <!-- 💭 深度思考 / 推理过程折叠卡片 (CoT Chain of Thought) -->
@@ -307,10 +323,22 @@ marked.setOptions({
   gfm: true
 })
 
+// Markdown 渲染缓存映射：防止长文本在 Vue 每次微小状态变动时重复繁重计算导致卡顿
+const markdownCache = new Map()
+
 function renderMarkdown(content) {
   if (!content) return ''
+  if (markdownCache.has(content)) {
+    return markdownCache.get(content)
+  }
   try {
-    return marked.parse(content)
+    const html = marked.parse(content)
+    if (markdownCache.size > 200) {
+      const first = markdownCache.keys().next().value
+      markdownCache.delete(first)
+    }
+    markdownCache.set(content, html)
+    return html
   } catch (e) {
     return content
   }
@@ -374,9 +402,25 @@ function loadSessionsFromStorage() {
   createNewSession()
 }
 
-// 保存会话到本地
+// 保存会话到本地 (对超长历史思考做安全裁剪，避免超出浏览器 localStorage 5MB 限制)
 function saveSessionsToStorage() {
-  localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sessions.value))
+  try {
+    const sanitized = sessions.value.map(s => ({
+      ...s,
+      messages: (s.messages || []).slice(-50).map(m => ({
+        role: m.role,
+        content: m.content,
+        thinking: m.thinking && m.thinking.length > 4000 ? m.thinking.slice(0, 4000) + '\n... [历史思考记录已截断存储]' : m.thinking,
+        toolCalls: m.toolCalls ? m.toolCalls.slice(0, 10) : [],
+        model: m.model,
+        duration_ms: m.duration_ms,
+        time: m.time
+      }))
+    }))
+    localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sanitized))
+  } catch (err) {
+    console.warn('存储会话失败(可能超出浏览器存储限额):', err)
+  }
 }
 
 // 当前激活的会话对象
@@ -389,8 +433,45 @@ const currentMessages = computed(() => {
   return currentSession.value?.messages || []
 })
 
+// 分页加载控制：默认只渲染最近的 PAGE_SIZE 条消息，极大减轻超长文本与 DOM 渲染压力
+const PAGE_SIZE = 8
+const displayCount = ref(PAGE_SIZE)
+
+// 实际渲染的消息列表（只展示最近 displayCount 条）
+const visibleMessages = computed(() => {
+  const all = currentMessages.value
+  if (all.length <= displayCount.value) return all
+  return all.slice(-displayCount.value)
+})
+
+// 历史更早消息条数
+const hiddenHistoryCount = computed(() => {
+  const total = currentMessages.value.length
+  return Math.max(0, total - displayCount.value)
+})
+
+function loadMoreHistory() {
+  displayCount.value += PAGE_SIZE
+}
+
+function getLiveStatusText(msg) {
+  if (msg.liveStatus) return msg.liveStatus
+  if (msg.toolCalls && msg.toolCalls.length && !msg.toolFinished) {
+    const lastTool = msg.toolCalls[msg.toolCalls.length - 1]
+    return `⚡ 正在服务器执行工具: ${lastTool.name}，请稍候...`
+  }
+  if (msg.thinking && !msg.content) {
+    return `💭 模型正在深度推理与构建分析 (${msg.thinking.length} 字)...`
+  }
+  if (msg.content) {
+    return `✍️ 正在组织输出报告...`
+  }
+  return `⚡ 正在调度云端大模型并准备执行...`
+}
+
 // 新建对话
 function createNewSession() {
+  displayCount.value = PAGE_SIZE
   const newId = 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)
   const newSession = {
     id: newId,
@@ -411,6 +492,7 @@ function createNewSession() {
 // 切换对话
 function switchSession(id) {
   currentSessionId.value = id
+  displayCount.value = PAGE_SIZE
   const target = sessions.value.find(s => s.id === id)
   if (target?.model) {
     selectedModel.value = target.model
@@ -540,6 +622,9 @@ async function submitCurrentMessage() {
 
   sending.value = true
 
+  // 确保新发送的消息在当前分页可见
+  displayCount.value = Math.max(displayCount.value, PAGE_SIZE)
+
   // 创建助手消息占位（开启流式状态）
   const aiMsg = {
     role: 'assistant',
@@ -551,7 +636,9 @@ async function submitCurrentMessage() {
     model: selectedModel.value,
     duration_ms: 0,
     time: timeStr,
-    streaming: true
+    streaming: true,
+    liveStatus: '⚡ 正在连接云端大模型并初始化环境...',
+    toolFinished: true
   }
   curSes.messages.push(aiMsg)
   scrollToBottom()
@@ -617,8 +704,16 @@ async function submitCurrentMessage() {
           } else if (data.type === 'text_delta' && data.delta) {
             aiMsg.content = (aiMsg.content || '') + data.delta
             scrollToBottom()
+          } else if (data.type === 'status' && data.status) {
+            aiMsg.liveStatus = data.status
+            if (data.status.includes('完成')) {
+              aiMsg.toolFinished = true
+            }
+            scrollToBottom()
           } else if (data.type === 'tool_use' && data.tool) {
             aiMsg.toolCalls.push(data.tool)
+            aiMsg.toolFinished = false
+            aiMsg.liveStatus = `⚡ 正在服务器执行工具: ${data.tool.name}...`
             scrollToBottom()
           } else if (data.type === 'done') {
             if (data.sessionId) curSes.cliSessionId = data.sessionId
@@ -626,6 +721,8 @@ async function submitCurrentMessage() {
             if (!aiMsg.content && data.reply) aiMsg.content = data.reply
             if (!aiMsg.thinking && data.thinking) aiMsg.thinking = data.thinking
             aiMsg.streaming = false
+            aiMsg.liveStatus = ''
+            if (aiMsg.content) renderMarkdown(aiMsg.content)
           } else if (data.type === 'error') {
             aiMsg.content = (aiMsg.content ? aiMsg.content + '\n\n' : '') + `❌ 错误: ${data.message}`
             aiMsg.streaming = false
@@ -1623,3 +1720,84 @@ onMounted(() => {
   font-size: 13px;
 }
 </style>
+
+/* 历史更早消息分页折叠栏 */
+.history-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 0 16px;
+  border-bottom: 1px dashed #2d3748;
+  margin-bottom: 16px;
+}
+
+.btn-load-history {
+  background: #1e293b;
+  border: 1px solid #3b82f6;
+  color: #93c5fd;
+  font-size: 13px;
+  padding: 7px 18px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.btn-load-history:hover {
+  background: #2563eb;
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.btn-load-history-all {
+  background: transparent;
+  border: 1px solid #4b5563;
+  color: #9ca3af;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-load-history-all:hover {
+  background: #374151;
+  color: #f3f4f6;
+}
+
+/* 实时动态执行状态指示胶囊 */
+.live-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(30, 41, 59, 0.9);
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  padding: 5px 12px;
+  border-radius: 16px;
+  font-size: 12px;
+  color: #60a5fa;
+  margin-bottom: 10px;
+  backdrop-filter: blur(4px);
+  animation: fadeInPill 0.3s ease;
+}
+
+.pulsing-radar {
+  width: 8px;
+  height: 8px;
+  background: #3b82f6;
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7);
+  animation: radarPulse 1.6s infinite;
+}
+
+@keyframes radarPulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 7px rgba(59, 130, 246, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+}
+
+@keyframes fadeInPill {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}

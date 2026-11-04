@@ -581,7 +581,7 @@ router.post('/cli/chat', async (req, res) => {
           LANG: 'zh_CN.UTF-8',
           LC_ALL: 'zh_CN.UTF-8'
         },
-        timeout: 120000
+        timeout: 600000
       });
 
       let stdoutRaw = '';
@@ -592,8 +592,19 @@ router.post('/cli/chat', async (req, res) => {
       let finalSessionId = resumeId || null;
       let stdoutBuffer = '';
 
+      // SSE 保活心跳定时器 (每 5 秒发送一次注释，防止代理/Nginx/浏览器超时中断)
+      let keepAliveTimer = null;
+      if (isStreaming) {
+        keepAliveTimer = setInterval(() => {
+          if (!res.writableEnded) {
+            res.write(': keepalive\n\n');
+          }
+        }, 5000);
+      }
+
       const onCloseClient = () => {
         try {
+          if (keepAliveTimer) clearInterval(keepAliveTimer);
           if (!res.writableEnded && !child.killed) child.kill('SIGTERM');
         } catch (e) {}
       };
@@ -640,6 +651,7 @@ router.post('/cli/chat', async (req, res) => {
                     toolCalls.push(tc);
                     if (isStreaming) {
                       res.write(`data: ${JSON.stringify({ type: 'tool_use', tool: tc })}\n\n`);
+                      res.write(`data: ${JSON.stringify({ type: 'status', status: `正在服务器执行工具: ${tc.name}...` })}\n\n`);
                     }
                   } else if (b.type === 'text' && !text) {
                     text = b.text;
@@ -664,6 +676,7 @@ router.post('/cli/chat', async (req, res) => {
       });
 
       child.on('close', code => {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
         res.off('close', onCloseClient);
         let reply = text.trim();
         if (!reply && stdoutRaw.trim()) {
@@ -685,6 +698,7 @@ router.post('/cli/chat', async (req, res) => {
       });
 
       child.on('error', err => {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
         res.off('close', onCloseClient);
         resolve({
           code: 1,
